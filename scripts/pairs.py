@@ -1,12 +1,19 @@
 """Training pairs for the format adapters: raw dictation -> formatted text, one set per catalogue format.
 
   uv run --with huggingface_hub python scripts/pairs.py catalogue            # validate catalogue, print control lines
-  with-secrets uv run --with anthropic --with huggingface_hub python scripts/pairs.py real [--format F]
-  with-secrets uv run --with anthropic python scripts/pairs.py synth --format F --n 40
-  with-secrets uv run --with anthropic python scripts/pairs.py teach [--format F]
+  with-secrets uv run --with huggingface_hub python scripts/pairs.py real [--format F]
+  with-secrets uv run python scripts/pairs.py synth --format F --n 40      # add --sync (before the subcommand) for pilots
+  with-secrets uv run python scripts/pairs.py teach [--format F]
   uv run python scripts/pairs.py check [--format F]                          # re-run format checks, print failures
   uv run python scripts/pairs.py split                                       # -> data/splits/{train,test}.jsonl
   with-secrets uv run --with huggingface_hub python scripts/pairs.py upload  # -> HF dataset (DATASET below)
+
+LLM calls go through the OpenRouter Batch API (POST /api/v1/batches; async, 24 h window, median minutes), stdlib
+only, OPENROUTER_API_KEY via with-secrets. Every submitted batch id is recorded in data/batches.json under a key
+built from its stage and inputs, so an interrupted run re-attaches to the same batch instead of paying twice.
+Prices checked 2026-10-31 (per M tokens in/out): teacher google/gemini-3.8-flash:batch 0.375/1.875 (what
+~google/gemini-flash-latest resolves to; batch needs a concrete id), drafter deepseek/deepseek-v4.1-flash:batch
+0.050/0.150. Compare batch vs sync on the day before bulk runs: OpenRouter batch is not always cheaper.
 
 real   Raw items from the public pool danielrosehill/ASR-Cleanup-Before-After (pool/pool.jsonl) whose use_case is in
        the format's real_use_cases, kept only if a Haiku fit check says the dictation is something a person would
@@ -14,7 +21,7 @@ real   Raw items from the public pool danielrosehill/ASR-Cleanup-Before-After (p
 synth  Haiku writes N scenarios for the format, then one raw Parakeet-style dictation per scenario (punctuated,
        cased, one block, fillers and false starts). -> data/sources/synth-<F>.jsonl
 teach  The teacher (Sonnet) applies catalogue/prompts/_shared.md + <F>.md to every source item; the format's
-       checks run on the output. -> data/pairs/<F>.jsonl (rows failing a check are kept, with checks_failed set;
+       checks run on the output. (Pilot 2026-10-31 used Claude Sonnet sync; switched to the batch teacher after.) -> data/pairs/<F>.jsonl (rows failing a check are kept, with checks_failed set;
        split leaves them out).
 split  Per format, a fixed held-out test set: up to TEST_REAL real items, then synthetic to TEST_TOTAL. Never trained on.
 
@@ -29,7 +36,6 @@ import json
 import random
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,10 +45,21 @@ DATA = ROOT / "data"
 POOL_REPO = "danielrosehill/ASR-Cleanup-Before-After"
 PROMPT_LIBRARY = "danielrosehill/Text-Transformation-Prompts-300525"
 DATASET = "danielrosehill/Dictation-Format-Pairs"
-TEACHER = "claude-sonnet-5-5"
-DRAFTER = "claude-haiku-5-5"
+TEACHER = "google/gemini-3.8-flash"
+DRAFTER = "deepseek/deepseek-v4.1-flash"
+# Gemini 3.x has no reasoning off switch; its reasoning tokens count against max_tokens, so low effort + high cap
+# (ASR-Post-Processor-Model saw 1,500-token caps cut replies, 2026-10-29). DeepSeek: {"enabled": false} or it
+# bills ~480 reasoning tokens per call even with exclude.
+# Synthetic dictations are written by a rotation of three families (item i -> WRITERS[i % 3]): one model's
+# habits would otherwise become the dataset's habits. Probe 2026-10-31 (OpenRouter-Batch-Notes notebook/09,
+# skill batch-jobs:synthetic-data-generation): every model given the same prompt converged on the same content;
+# mixing families cut wording overlap ~3x. Variety itself comes from the per-item scenario seed.
+WRITERS = ["deepseek/deepseek-v4.1-flash", "anthropic/claude-haiku-5.5", "google/gemini-3.1-flash-lite"]
+REASONING = {TEACHER: {"effort": "low"}, DRAFTER: {"enabled": False}, "anthropic/claude-haiku-5.5": {"enabled": False},
+             "google/gemini-3.1-flash-lite": {"effort": "low"}}
+SYNC = False  # --sync: same requests as threaded sync calls (pilots: a 1-request batch sat in_progress 40+ min, 2026-10-31)
+OR_API = "https://openrouter.ai/api/v1"
 TEST_REAL, TEST_TOTAL = 8, 15
-WORKERS = 8
 
 FORMATS = {f["id"]: f for f in CATALOGUE["formats"]}
 
@@ -64,15 +81,93 @@ def write(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
 
 
-def ask(model: str, system: str, user: str, max_tokens: int = 3000) -> str:
-    import anthropic
+def _or(method: str, path: str, body: dict | None = None, missing_ok: bool = False) -> dict | None:
+    import os
+    import urllib.error
+    import urllib.request
 
-    global _client
-    if "_client" not in globals():
-        _client = anthropic.Anthropic()
-    m = _client.messages.create(model=model, max_tokens=max_tokens, system=system,
-                                messages=[{"role": "user", "content": user}])
-    return "".join(b.text for b in m.content if b.type == "text").strip()
+    key = os.environ.get("OPENROUTER_API_KEY") or sys.exit("OPENROUTER_API_KEY not set: run under `with-secrets`")
+    req = urllib.request.Request(f"{OR_API}{path}", method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=300).read())
+    except urllib.error.HTTPError as e:
+        if missing_ok and e.code == 404:
+            return None
+        sys.exit(f"{method} {path}: HTTP {e.code} {e.read().decode()[:1500]}")
+
+
+def sync(stage: str, model: str, jobs: list[tuple[str, str, str]], max_tokens: int) -> dict[str, str]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(job):
+        i, sy, u = job
+        d = _or("POST", "/chat/completions", {"model": model, "max_tokens": max_tokens, "reasoning": REASONING[model],
+                                               "messages": [{"role": "system", "content": sy}, {"role": "user", "content": u}]})
+        ch = d["choices"][0]
+        return i, ("" if ch.get("finish_reason") == "length" else (ch["message"].get("content") or "").strip()), \
+            (d.get("usage") or {}).get("cost") or 0
+
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(one, jobs))
+    out = {i: t for i, t, _ in res if t}
+    cost = sum(c for *_, c in res)
+    print(f"{stage}: {len(out)}/{len(jobs)} ok (sync, {model}), US${cost:.4f}", flush=True)
+    with open(DATA / "usage.jsonl", "a") as f:
+        f.write(json.dumps({"stage": stage, "model": model, "mode": "sync", "ok": len(out), "cost": cost}) + "\n")
+    return out
+
+
+def batch(stage: str, model: str, jobs: list[tuple[str, str, str]], max_tokens: int = 8000) -> dict[str, str]:
+    """jobs = [(id, system, user)] -> {id: reply text}. Failed or truncated requests are left out (and reported)."""
+    import hashlib
+    import time
+
+    if not jobs:
+        return {}
+    if SYNC:
+        return sync(stage, model, jobs, max_tokens)
+    ledger_path = DATA / "batches.json"
+    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+    key = f"{stage}:{model}:" + hashlib.sha256(json.dumps(jobs).encode()).hexdigest()[:16]
+    if key in ledger:
+        bid = ledger[key]["id"]
+        print(f"{stage}: re-attaching to batch {bid}", flush=True)
+    else:
+        # Key order matters: endpoint/model/completion_window before requests, else 400 (batch-jobs runner, 2026-10-22).
+        body = {"endpoint": "/v1/chat/completions", "model": model, "completion_window": "24h", "requests": [
+            {"custom_id": i, "body": {"max_tokens": max_tokens, "reasoning": REASONING[model],
+                                      "messages": [{"role": "system", "content": sy}, {"role": "user", "content": u}]}}
+            for i, sy, u in jobs]}
+        bid = _or("POST", "/batches", body)["id"]
+        ledger[key] = {"id": bid, "stage": stage, "model": model, "n": len(jobs)}
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps(ledger, indent=1))
+        print(f"{stage}: batch {bid}, {len(jobs)} requests to {model}", flush=True)
+    t0 = time.time()
+    while True:  # a GET right after submit 404s for a while (seen 2026-10-22)
+        b = _or("GET", f"/batches/{bid}", missing_ok=time.time() - t0 < 300)
+        if b and b["status"] in {"completed", "failed", "expired", "cancelled"}:
+            break
+        c = (b or {}).get("request_counts") or {}
+        print(f"  {bid}: {(b or {}).get('status', 'not visible yet')} {c.get('completed', 0)}/{c.get('total', '?')}", flush=True)
+        time.sleep(30)
+    if b["status"] != "completed":
+        sys.exit(f"{stage}: batch {bid} {b['status']} {b.get('error')}")
+    out, bad = {}, 0
+    for r in b.get("results") or []:
+        resp = r.get("response") or {}
+        ch = ((resp.get("body") or {}).get("choices") or [{}])[0]
+        if r.get("error") or resp.get("status_code") != 200 or ch.get("finish_reason") == "length":
+            bad += 1
+            continue
+        out[r["custom_id"]] = (ch["message"].get("content") or "").strip()
+    u = b.get("usage") or {}
+    print(f"{stage}: {len(out)} ok, {bad} failed; {u.get('prompt_tokens')} in / {u.get('completion_tokens')} out, US${u.get('cost')}", flush=True)
+    with open(DATA / "usage.jsonl", "a") as f:
+        f.write(json.dumps({"stage": stage, "model": model, "batch": bid, "ok": len(out), "failed": bad,
+                            "provider": b.get("provider"), "usage": u}) + "\n")
+    return out
 
 
 def pick(args_format: str | None) -> list[str]:
@@ -152,16 +247,17 @@ def cmd_real(args: argparse.Namespace) -> None:
         f = FORMATS[fmt]
         cands = [r for r in pool if r["use_case"] in f["real_use_cases"] and r["words_in"] >= args.min_words]
 
-        def judge(r):
+        replies = batch(f"real-{fmt}", DRAFTER, [(r["id"], FIT, f"Format: {f['label']}\n\nTranscript:\n{r['input']}")
+                                                 for r in cands], 300)
+        kept = []
+        for r in cands:
             try:
-                v = json.loads(re.search(r"\{.*\}", ask(DRAFTER, FIT, f"Format: {f['label']}\n\nTranscript:\n{r['input']}", 200), re.S).group())
+                v = json.loads(re.search(r"\{.*\}", replies.get(r["id"], ""), re.S).group())
             except (AttributeError, json.JSONDecodeError):
-                return None
-            return {"id": f"real-{r['id']}", "format": fmt, "input": r["input"], "source": f"pool:{r['id']}",
-                    "use_case": r["use_case"], "fit_why": v.get("why")} if v.get("fits") else None
-
-        with ThreadPoolExecutor(WORKERS) as ex:
-            kept = [x for x in ex.map(judge, cands) if x]
+                continue
+            if v.get("fits"):
+                kept.append({"id": f"real-{r['id']}", "format": fmt, "input": r["input"], "source": f"pool:{r['id']}",
+                             "use_case": r["use_case"], "fit_why": v.get("why")})
         write(DATA / "sources" / f"real-{fmt}.jsonl", kept)
         print(f"{fmt}: {len(kept)}/{len(cands)} pool candidates fit -> data/sources/real-{fmt}.jsonl")
 
@@ -184,20 +280,27 @@ def cmd_synth(args: argparse.Namespace) -> None:
     fmt, f = args.format, FORMATS[args.format]
     out = DATA / "sources" / f"synth-{fmt}.jsonl"
     have = read(out)
-    raw = ask(DRAFTER, "You write test scenarios.", SCENARIOS.format(n=args.n, label=f["label"].lower()), 4000)
-    scenarios = json.loads(re.search(r"\[.*\]", raw, re.S).group())[: args.n]
-    rng = random.Random(len(have))
-    jobs = [(s, rng.choice(["30-60", "60-120", "120-250"])) for s in scenarios]
-
-    def one(job):
-        s, words = job
-        return ask(DRAFTER, DICTATE.format(label=f["label"].lower(), words=words), s, 1500)
-
-    with ThreadPoolExecutor(WORKERS) as ex:
-        texts = list(ex.map(one, jobs))
     start = len(have)
-    rows = have + [{"id": f"synth-{fmt}-{start + i:04d}", "format": fmt, "input": t, "source": "synth",
-                    "scenario": s, "drafter": DRAFTER} for i, ((s, _), t) in enumerate(zip(jobs, texts)) if t]
+    # Scenarios in chunks of 25 (one long list in one reply repeats itself), all chunks in one batch.
+    chunks = [min(25, args.n - k) for k in range(0, args.n, 25)]
+    sc = batch(f"scenarios-{fmt}-{start}", DRAFTER, [(f"c{k}", "You write test scenarios. Reply with a JSON array only.",
+               SCENARIOS.format(n=n, label=f["label"].lower()) + f" (Set {k + 1} of {len(chunks)}: avoid the obvious ones.)")
+               for k, n in enumerate(chunks)], 4000)
+    scenarios = []
+    for k in range(len(chunks)):
+        try:
+            scenarios += json.loads(re.search(r"\[.*\]", sc.get(f"c{k}", ""), re.S).group())
+        except (AttributeError, json.JSONDecodeError):
+            print(f"  scenario chunk {k} unparseable, skipped")
+    rng = random.Random(start)
+    jobs = [(f"synth-{fmt}-{start + i:04d}", s, rng.choice(["30-60", "60-120", "120-250"])) for i, s in enumerate(scenarios[: args.n])]
+    writer = {i: WRITERS[n % len(WRITERS)] for n, (i, _, _) in enumerate(jobs)}
+    texts = {}
+    for w_model in WRITERS:  # one batch per writer model
+        texts |= batch(f"synth-{fmt}-{start}-{w_model.split('/')[1]}", w_model,
+                       [(i, DICTATE.format(label=f["label"].lower(), words=w), s) for i, s, w in jobs if writer[i] == w_model], 1500)
+    rows = have + [{"id": i, "format": fmt, "input": texts[i], "source": "synth", "scenario": s, "drafter": writer[i]}
+                   for i, s, _ in jobs if texts.get(i)]
     write(out, rows)
     print(f"{fmt}: +{len(rows) - start} synthetic dictations ({len(rows)} total) -> {out.relative_to(ROOT)}")
 
@@ -209,13 +312,10 @@ def cmd_teach(args: argparse.Namespace) -> None:
         todo = [r for p in sorted((DATA / "sources").glob(f"*-{fmt}.jsonl")) for r in read(p) if r["id"] not in done]
         system = teacher_prompt(fmt)
 
-        def one(r):
-            o = ask(TEACHER, system, r["input"])
-            return {"id": r["id"], "format": fmt, "control": control(fmt), "input": r["input"], "output": o,
-                    "source": r["source"], "teacher": TEACHER, "checks_failed": run_checks(fmt, o)}
-
-        with ThreadPoolExecutor(WORKERS) as ex:
-            new = list(ex.map(one, todo))
+        outs = batch(f"teach-{fmt}", TEACHER, [(r["id"], system, r["input"]) for r in todo])
+        new = [{"id": r["id"], "format": fmt, "control": control(fmt), "input": r["input"], "output": outs[r["id"]],
+                "source": r["source"], "teacher": TEACHER, "checks_failed": run_checks(fmt, outs[r["id"]])}
+               for r in todo if outs.get(r["id"])]
         write(out, read(out) + new)
         bad = sum(bool(r["checks_failed"]) for r in new)
         print(f"{fmt}: +{len(new)} pairs, {bad} failing checks -> {out.relative_to(ROOT)}")
@@ -278,7 +378,10 @@ def main() -> None:
         t.set_defaults(func=fn)
     sub.add_parser("split").set_defaults(func=cmd_split)
     sub.add_parser("upload").set_defaults(func=cmd_upload)
+    p.add_argument("--sync", action="store_true", help="threaded sync calls instead of the Batch API (pilots)")
     a = p.parse_args()
+    global SYNC
+    SYNC = a.sync
     a.func(a)
 
 

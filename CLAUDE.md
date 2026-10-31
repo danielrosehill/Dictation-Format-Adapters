@@ -26,5 +26,7 @@ Public repo: a catalogue of LoRA format adapters on top of the dictation cleanup
 - `data/` is gitignored. Pairs live in the HF dataset `danielrosehill/Dictation-Format-Pairs` (public, created by
   `pairs.py upload`). Sources are the public pool and synthetic text only.
 - Training runs on Modal (`MODAL_PROFILE=danielrosehill`). The laptop has no GPU; 0.6B inference runs on CPU.
-- Secrets via `with-secrets` (Infisical): `ANTHROPIC_API_KEY`, `HF_TOKEN`. Python via `uv`.
+- LLM calls go through the OpenRouter Batch API (`scripts/pairs.py` `batch()`; ledger `data/batches.json` re-attaches
+  an interrupted run to its batch). Re-check prices before bulk runs: skill `batch-jobs:check-api-prices`.
+- Secrets via `with-secrets` (Infisical): `OPENROUTER_API_KEY`, `HF_TOKEN`. Python via `uv`.
 - Licence: "S1-mini by Superwhisper" must be named wherever an adapter is published or used.

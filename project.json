@@ -6,13 +6,40 @@
   "updated": "2026-10-31",
   "status": "data",
   "phase": 1,
-  "base": {"repo": "danielrosehill/S1-ASR-Cleanup", "revision": "6b38b1877e59b6524465b7206f92102f40744028", "params": 600000000},
+  "base": {
+    "repo": "danielrosehill/S1-ASR-Cleanup",
+    "revision": "6b38b1877e59b6524465b7206f92102f40744028",
+    "params": 600000000
+  },
   "catalogue_version": "v0",
-  "formats": ["shopping-list", "todo-list", "casual-email", "business-email", "blog-outline", "calendar-json"],
-  "teacher": "claude-sonnet-5-5",
-  "drafter": "claude-haiku-5-5",
+  "formats": [
+    "shopping-list",
+    "todo-list",
+    "casual-email",
+    "business-email",
+    "blog-outline",
+    "calendar-json"
+  ],
+  "teacher": "google/gemini-3.8-flash (OpenRouter batch)",
+  "drafter": "scenarios + fit: deepseek/deepseek-v4.1-flash; dictations rotate deepseek-v4.1-flash / claude-haiku-5.5 / gemini-3.1-flash-lite (OpenRouter)",
   "compute": "Modal, profile danielrosehill, L4/A10G",
-  "hf": {"pairs_dataset": "danielrosehill/Dictation-Format-Pairs", "adapters": "danielrosehill/S1-ASR-Format-<format> (planned)"},
-  "pilot": {"date": "2026-10-31", "format": "blog-outline", "items": 6, "passed_checks": 5,
-            "note": "Failure: a synthetic dictation with one point; outline_shape rejected it as intended."}
+  "hf": {
+    "pairs_dataset": "danielrosehill/Dictation-Format-Pairs",
+    "adapters": "danielrosehill/S1-ASR-Format-<format> (planned)"
+  },
+  "pilot": {
+    "date": "2026-10-31",
+    "format": "blog-outline",
+    "items": 6,
+    "passed_checks": 5,
+    "note": "Failure: a synthetic dictation with one point; outline_shape rejected it as intended."
+  },
+  "pilot2": {
+    "date": "2026-10-31",
+    "format": "shopping-list",
+    "items": 6,
+    "passed_checks": 6,
+    "cost_usd": 0.0047,
+    "mode": "sync"
+  }
 }
