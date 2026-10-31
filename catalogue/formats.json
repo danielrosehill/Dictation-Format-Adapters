@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "updated": "2026-10-31",
+  "about": "The bounded catalogue of output formats. Each format is one LoRA adapter on top of the cleanup model (docs/decisions/0001). The id is the adapter name, the [Format: id] control tag and the file stem of catalogue/prompts/<id>.md (the teacher prompt that writes the training targets).",
+  "cleanup_model": {
+    "repo": "danielrosehill/S1-ASR-Cleanup",
+    "revision": "6b38b1877e59b6524465b7206f92102f40744028",
+    "release": "v1.0 (405 pairs, merged LoRA on superwhisper/s1-mini@88f6b15896c73bbb13a3b596e0afe8ea0d5150b4)",
+    "control": "[Styling: semi-formal] [Structure: prose] [Context: general] [Layers: 1,2]",
+    "note": "Format 'none' = the cleanup model alone, no adapter. Built and trained in github.com/danielrosehill/ASR-Post-Processor-Model, not here."
+  },
+  "signature": {
+    "casual": "Daniel",
+    "formal": "Daniel Rosehill"
+  },
+  "formats": [
+    {
+      "id": "shopping-list",
+      "label": "Shopping list",
+      "kind": "list",
+      "s1_axes": "[Styling: semi-formal] [Structure: lists] [Context: general]",
+      "source_prompt": null,
+      "source_note": "No shopping-list prompt in Text-Transformation-Prompts-300525; written fresh.",
+      "real_use_cases": ["note", "message"],
+      "checks": ["bullets_only", "no_preamble"]
+    },
+    {
+      "id": "todo-list",
+      "label": "To-do list",
+      "kind": "list",
+      "s1_axes": "[Styling: semi-formal] [Structure: lists] [Context: general]",
+      "source_prompt": "To Do List (Unstructured)",
+      "source_note": "Inference of dates and owners removed: only what was said.",
+      "real_use_cases": ["note", "message", "ai_prompt"],
+      "checks": ["checkboxes_only", "no_preamble"]
+    },
+    {
+      "id": "casual-email",
+      "label": "Casual email",
+      "kind": "email",
+      "s1_axes": "[Styling: semi-formal] [Structure: prose] [Context: email]",
+      "source_prompt": "Casual Email",
+      "source_note": "Kept: friendly greeting, sign-off with first name.",
+      "real_use_cases": ["email", "message"],
+      "checks": ["email_shape", "signed:casual", "no_preamble"]
+    },
+    {
+      "id": "business-email",
+      "label": "Business email",
+      "kind": "email",
+      "s1_axes": "[Styling: formal] [Structure: prose] [Context: email]",
+      "source_prompt": "Business Email",
+      "source_note": "'Eliminating unnecessary details' removed: every fact the speaker gave is kept.",
+      "real_use_cases": ["email", "message"],
+      "checks": ["email_shape", "signed:formal", "no_preamble"]
+    },
+    {
+      "id": "blog-outline",
+      "label": "Blog outline",
+      "kind": "structured",
+      "s1_axes": "[Styling: semi-formal] [Structure: lists] [Context: general]",
+      "source_prompt": "Blog outline",
+      "source_note": "Markdown shape fixed (one H1, H2 sections, bullets) so the adapter learns one layout, not several.",
+      "real_use_cases": ["note", "ai_prompt", "tech", "other"],
+      "checks": ["outline_shape", "no_preamble"]
+    },
+    {
+      "id": "calendar-json",
+      "label": "Calendar entries (JSON)",
+      "kind": "json",
+      "s1_axes": "[Styling: semi-formal] [Structure: lists] [Context: general]",
+      "source_prompt": "Calendar Entries (JSON)",
+      "source_note": "No inferred times or attendee emails: unstated fields are null, dates stay as spoken in date_text.",
+      "real_use_cases": ["calendar"],
+      "checks": ["calendar_json"]
+    }
+  ]
+}
