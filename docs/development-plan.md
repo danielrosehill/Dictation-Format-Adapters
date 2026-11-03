@@ -18,7 +18,7 @@ added facts, dataset on HF.
 
 Cost estimate (prices 2026-10-31, OpenRouter batch): ~500 teacher calls on `google/gemini-3.8-flash` at ~600 in +
 ~1,000 out tokens (reasoning included) ≈ $1.10, plus ~1,000 drafter calls on `deepseek/deepseek-v4.1-flash` ≈ $0.10.
-Re-check with `batch-jobs:check-api-prices` before running.
+Re-check with `llm-ops:check-api-prices` before running.
 Measured in pilot 2 (sync): about US$0.80 per 1,000 pairs.
 
 ## Phase 2: first adapters

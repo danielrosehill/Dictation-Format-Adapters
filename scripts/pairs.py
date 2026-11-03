@@ -52,7 +52,7 @@ DRAFTER = "deepseek/deepseek-v4.1-flash"
 # bills ~480 reasoning tokens per call even with exclude.
 # Synthetic dictations are written by a rotation of three families (item i -> WRITERS[i % 3]): one model's
 # habits would otherwise become the dataset's habits. Probe 2026-10-31 (OpenRouter-Batch-Notes notebook/09,
-# skill batch-jobs:synthetic-data-generation): every model given the same prompt converged on the same content;
+# skill llm-ops:synthetic-data-generation): every model given the same prompt converged on the same content;
 # mixing families cut wording overlap ~3x. Variety itself comes from the per-item scenario seed.
 WRITERS = ["deepseek/deepseek-v4.1-flash", "anthropic/claude-haiku-5.5", "google/gemini-3.1-flash-lite"]
 REASONING = {TEACHER: {"effort": "low"}, DRAFTER: {"enabled": False}, "anthropic/claude-haiku-5.5": {"enabled": False},
